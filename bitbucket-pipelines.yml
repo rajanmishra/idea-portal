@@ -1,0 +1,178 @@
+image:
+  name: 406421550649.dkr.ecr.eu-west-1.amazonaws.com/codebuild:v2.0.14.3
+  aws:
+    access-key: $AWS_ACCESS_KEY_ID
+    secret-key: $AWS_SECRET_ACCESS_KEY
+
+clone:
+  depth: full # SonarCloud scanner needs the full history to assign issues properly
+
+definitions:
+  caches:
+    npm-home: $HOME/.npm
+    sonar: ~/.sonar/cache
+
+  services:
+    mongo:
+      image: mongo:4.4
+    redis:
+      image: redis
+
+  steps:
+    - step: &dev-ci
+        name: Dev CI
+        caches:
+          - npm-home
+          # No use for node cache because npm ci removes node_modules
+        services:
+          - mongo
+          - redis
+        script:
+          - node --version
+          - aws s3 cp s3://getir-devops/npmjs/.npmrc .npmrc
+          - npm ci --no-audit --no-fund --prefer-offline
+          - npm run unused
+          - npm run lint
+          - npm test
+        artifacts:
+          - coverage/**
+
+    - step: &dev-ci-audit
+        <<: *dev-ci
+        name: Dev CI & audit
+        # Duplicate code to not have separate steps
+        script:
+          - node --version
+          - aws s3 cp s3://getir-devops/npmjs/.npmrc .npmrc
+          - npm ci --no-audit --no-fund --prefer-offline
+          - npm run unused
+          - npm run audit-custom
+          - npm run lint
+          - npm test
+
+    - step: &tag-dev
+        name: Create development tag
+        image: atlassian/default-image:2
+        clone:
+          enabled: false
+        script:
+          - echo d${BITBUCKET_COMMIT:0:6} > tag.txt
+        artifacts:
+          download: false
+          paths:
+            - tag.txt
+
+    - step: &tag-branch
+        <<: *tag-dev
+        name: Create branch tag
+        script:
+          - echo ${TAGNAME} > tag.txt
+
+    - step: &tag-staging
+        <<: *tag-dev
+        name: Create staging tag
+        script:
+          - echo s${BITBUCKET_COMMIT:0:6} > tag.txt
+
+    - step: &gitleaks
+        name: Scan for hardcoded secrets with gitleaks
+        script:
+          - gitleaks --path=./ --verbose --redact
+        artifacts:
+          download: false
+
+    - step: &gitleaks-pr
+        name: Scan PR for hardcoded secrets with gitleaks
+        script:
+          - git fetch origin $TARGET_BRANCH
+          - PR_COMMITS=$(git log origin/$TARGET_BRANCH..$BITBUCKET_BRANCH --format=format:%H | paste -sd ',' -)
+          - gitleaks --path=./ --commits="${PR_COMMITS}" --verbose --redact
+        artifacts:
+          download: false
+
+    - step: &sonar-analysis
+        name: Analyze on SonarCloud
+        image: sonarsource/sonarcloud-scan:1.2.2
+        caches:
+          - sonar
+        script:
+          - /usr/bin/run-scanner.sh
+
+    - step: &git-tag-prod
+        name: Create production git tag
+        image: atlassian/default-image:2
+        script:
+          # get and check package version
+          - PACKAGE_VERSION=$(node -e "console.log(require('./package.json').version)")
+          - if ! [[ "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Release step is only allowed for SemVer release versions, current version is \"$PACKAGE_VERSION\"." 1>&2;
+              exit 1;
+            fi
+          # make and push a tag with that version
+          - VERSION_TAG="v$PACKAGE_VERSION"
+          - echo ${VERSION_TAG} > tag.txt
+          - echo "Making a git tag \"$VERSION_TAG\""
+          - git tag -a "$VERSION_TAG" -m "$VERSION_TAG"
+          # rebase/fast-forward dev on master
+          - git fetch origin dev
+          - git checkout dev --
+          - git rebase master
+          - git remote set-url origin https://${PIPELINE_BITBUCKET_USER}:${PIPELINE_BITBUCKET_USER_PASSWORD}@bitbucket.org/${BITBUCKET_REPO_FULL_NAME}
+          - git push --follow-tags
+        artifacts:
+          download: false
+          paths:
+            - tag.txt
+
+    - step: &trigger-deployment
+        name: Build & push Docker image
+        caches:
+          - docker
+        services:
+          - docker
+        script:
+          - TAG=$(<tag.txt)
+          - DOCKER_TAG=${AWS_ACCOUNT_ID}.dkr.ecr.eu-west-1.amazonaws.com/${BITBUCKET_REPO_SLUG}:${TAG}
+          - aws s3 cp s3://getir-devops/npmjs/.npmrc .npmrc
+          - aws ecr get-login --region ${AWS_DEFAULT_REGION} --no-include-email | sh
+          - docker build --tag ${DOCKER_TAG} .
+          - docker push ${DOCKER_TAG}
+
+pipelines:
+  branches:
+    dev:
+      - step: *dev-ci-audit
+      - parallel:
+        - step: *gitleaks
+        - step: *sonar-analysis
+      - step: *tag-dev
+      - step: *trigger-deployment
+
+    master:
+      - step: *dev-ci-audit
+      - parallel:
+        - step: *gitleaks
+        - step: *sonar-analysis
+      # Tag and deploy to staging automatically
+      - step: *tag-staging
+      - step: *trigger-deployment
+      # Tag and deploy to production manually
+      - step:
+          <<: *git-tag-prod
+          trigger: manual
+      - step: *trigger-deployment
+
+  pull-requests:
+    '**':
+      - step: *dev-ci
+      - parallel:
+        - step: *gitleaks-pr
+        - step: *sonar-analysis
+
+  custom:
+    tbe-ci:
+      - variables:
+        - name: TAGNAME
+      - step: *dev-ci
+      - step: *tag-branch
+      - step: *trigger-deployment
